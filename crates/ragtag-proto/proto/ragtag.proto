@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package ragtag;
+
+// Shared device stability hint.
+enum Stability {
+  STABLE = 0;
+  OPPORTUNISTIC = 1;
+}
+
+// Self-reported node capability, sent in every heartbeat.
+message NodeCapability {
+  bytes node_id = 1;
+  float tokens_per_sec = 2;
+  uint64 free_ram_bytes = 3;
+  bool reachable = 4;
+  Stability stability = 5;
+  // Milliseconds since an unspecified epoch; the receiver should treat this
+  // as informational and refresh its own local heartbeat timer.
+  int64 last_heartbeat_ms = 6;
+}
+
+// A contiguous layer range assigned to a node.
+message LayerRange {
+  bytes node_id = 1;
+  uint32 start_layer = 2;
+  uint32 end_layer = 3;
+  string next_hop = 4; // "ip:port"
+}
+
+// Complete partition pushed by the coordinator after every re-solve.
+message PartitionPlan {
+  repeated LayerRange assignments = 1;
+}
+
+// Identifier used to subscribe to plan updates.
+message NodeId {
+  bytes node_id = 1;
+}
+
+// Empty acknowledgement.
+message Ack {}
+
+// One chunk of a split activation tensor.
+message ActivationChunk {
+  bytes request_id = 1;
+  uint64 sequence_no = 2;
+  bytes payload = 3;
+}
+
+// Pipeline ring transport: a node receives a stream of chunks, executes its
+// assigned layers, and forwards the resulting stream to the next hop.
+service RingTransport {
+  rpc Forward(stream ActivationChunk) returns (stream ActivationChunk);
+}
+
+// Coordinator-facing service on the coordinator node.
+service Coordinator {
+  rpc Heartbeat(NodeCapability) returns (Ack);
+  rpc WatchPlan(NodeId) returns (stream PartitionPlan);
+}

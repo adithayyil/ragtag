@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/*.rlib
+**/*.rmeta
+
+# Cargo lockfile for library crates (keep for binaries in this workspace)
+# Cargo.lock is committed for reproducible coordinator/node builds.
+
+# Nix
+/result
+/result-*
+.direnv
+.envrc
+
+# IDE / editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Large model weights — keep the models/ directory, but not the .gguf files.
+# Copy or symlink your own weights into models/ for local/manual tests.
+/models/*.gguf
+/models/*.bin
+/models/*.safetensors

@@ -1,0 +1,21 @@
+[package]
+name = "ragtag-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "gRPC protocol definitions and generated code for ragtag"
+build = "build.rs"
+
+[dependencies]
+ragtag-core = { path = "../ragtag-core" }
+prost = "0.14.4"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+uuid = { version = "1.24.1", features = ["serde"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

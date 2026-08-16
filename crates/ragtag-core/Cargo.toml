@@ -1,0 +1,13 @@
+[package]
+name = "ragtag-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared types for the ragtag distributed inference cluster"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_millis = "0.1.1"
+uuid = { version = "1.24.1", features = ["v4", "serde"] }

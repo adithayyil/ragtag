@@ -1,0 +1,32 @@
+[package]
+name = "ragtag-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ragtag node agent binary"
+
+[[bin]]
+name = "ragtag-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.89"
+clap = { version = "4.6.6", features = ["derive"] }
+futures = "0.3.34"
+mdns-sd = "0.21.0"
+ragtag-core = { path = "../ragtag-core" }
+ragtag-proto = { path = "../ragtag-proto" }
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync", "net"] }
+tonic = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.24.1", features = ["v4"] }

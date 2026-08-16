@@ -1,0 +1,16 @@
+[package]
+name = "ragtag-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DP-based pipeline layer partition scheduler"
+
+[dependencies]
+ragtag-core = { path = "../ragtag-core" }
+thiserror = "2.0.20"
+uuid = { version = "1.24.1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
