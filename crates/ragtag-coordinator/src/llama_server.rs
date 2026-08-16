@@ -178,7 +178,7 @@ impl LlamaServerManager {
             .arg("--split-mode")
             .arg("layer")
             .arg("--n-gpu-layers")
-            .arg("all")
+            .arg("0")
             .arg("--host")
             .arg(&self.host)
             .arg("--port")
