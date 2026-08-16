@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use chrono::Local;
 use clap::Parser;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
@@ -15,18 +16,19 @@ use ragtag_core::{NodeCapability, PartitionPlan};
 use ragtag_proto::pb::{
     coordinator_server::{Coordinator, CoordinatorServer},
     ring_transport_client::RingTransportClient,
-    ActivationChunk,
+    ActivationChunk, ClusterStats, Empty, NodeStats, Stability as PbStability,
 };
 use ragtag_scheduler::{solve, LinearCostModel, ScheduledInput};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -40,6 +42,20 @@ use uuid::Uuid;
 mod llama_server;
 
 const DEFAULT_SERVICE_TYPE: &str = "_ragtag._tcp.local.";
+
+fn system_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
 
 fn service_type() -> String {
     std::env::var("RAGTAG_SERVICE_TYPE").unwrap_or_else(|_| DEFAULT_SERVICE_TYPE.to_string())
@@ -97,14 +113,17 @@ pub struct CoordinatorState {
     nodes: DashMap<Uuid, NodeCapability>,
     addrs: DashMap<Uuid, SocketAddr>,
     rpc_addrs: DashMap<Uuid, SocketAddr>,
+    hostnames: DashMap<Uuid, String>,
     plan_tx: watch::Sender<PartitionPlan>,
     llama_ready: AtomicBool,
+    events: Mutex<VecDeque<String>>,
     llama_client: Client,
     total_layers: u32,
     bytes_per_layer: u64,
     seconds_per_layer: f32,
     heartbeat_timeout: Duration,
     model: Option<PathBuf>,
+    coordinator_hostname: String,
     llama_host: String,
     llama_port: u16,
 }
@@ -119,6 +138,8 @@ impl CoordinatorState {
             nodes: DashMap::new(),
             addrs: DashMap::new(),
             rpc_addrs: DashMap::new(),
+            hostnames: DashMap::new(),
+            events: Mutex::new(VecDeque::new()),
             plan_tx,
             llama_ready: AtomicBool::new(false),
             llama_client: Client::new(),
@@ -127,6 +148,7 @@ impl CoordinatorState {
             seconds_per_layer: args.seconds_per_layer,
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
             model: args.model.clone(),
+            coordinator_hostname: system_hostname(),
             llama_host: args.llama_host.clone(),
             llama_port: args.llama_port,
         };
@@ -156,11 +178,21 @@ impl CoordinatorState {
         let plan = solve(self.total_layers, &input, &cost)?;
 
         let _ = self.plan_tx.send(plan.clone());
+        let summary = plan
+            .assignments
+            .iter()
+            .map(|a| {
+                let host = self.node_hostname(a.node_id);
+                format!("{}={}-{}", host, a.start_layer, a.end_layer)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
             "recomputed plan: {} assignments, {} layers",
             plan.assignments.len(),
             plan.total_layers()
         );
+        self.log_event(format!("plan({}): {}", plan.total_layers(), summary));
         Ok(plan)
     }
 
@@ -169,6 +201,7 @@ impl CoordinatorState {
             Ok(_) => {}
             Err(e) => {
                 warn!("scheduler error: {}", e);
+                self.log_event(format!("plan infeasible: {}", e));
                 let _ = self.plan_tx.send(PartitionPlan {
                     assignments: Vec::new(),
                 });
@@ -215,6 +248,29 @@ impl CoordinatorState {
         Ok(args)
     }
 
+    fn node_hostname(&self, node_id: Uuid) -> String {
+        self.hostnames
+            .get(&node_id)
+            .map(|h| h.clone())
+            .unwrap_or_else(|| {
+                node_id
+                    .to_string()
+                    .split('-')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+    }
+
+    pub fn log_event(&self, msg: impl Into<String>) {
+        let text = format!("{} {}", Local::now().format("%H:%M:%S"), msg.into());
+        let mut events = self.events.lock().unwrap();
+        events.push_back(text);
+        while events.len() > 50 {
+            events.pop_front();
+        }
+    }
+
     fn llama_server_url(&self) -> Option<String> {
         if self.llama_ready.load(Ordering::Relaxed) {
             Some(format!("http://{}:{}", self.llama_host, self.llama_port))
@@ -256,6 +312,11 @@ impl Coordinator for CoordinatorService {
             .get("rpc-addr")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
+        let hostname = request
+            .metadata()
+            .get("hostname")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let inner = request.into_inner();
         let cap =
             NodeCapability::try_from(inner).map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -278,6 +339,14 @@ impl Coordinator for CoordinatorService {
             }
         }
 
+        let hostname = hostname.unwrap_or_else(|| self.0.node_hostname(node_id));
+        let was_unreachable = self
+            .0
+            .nodes
+            .get(&node_id)
+            .map(|n| !n.reachable)
+            .unwrap_or(false);
+
         let mut cap = cap;
         cap.reachable = true;
         cap.last_heartbeat = Instant::now();
@@ -296,6 +365,14 @@ impl Coordinator for CoordinatorService {
             // supplied, so older nodes can still be scheduled until the
             // RingTransport path is removed.
             self.0.rpc_addrs.insert(node_id, *addr);
+        }
+
+        self.0.hostnames.insert(node_id, hostname.clone());
+
+        if is_new {
+            self.0.log_event(format!("node {} joined", hostname));
+        } else if was_unreachable {
+            self.0.log_event(format!("node {} reachable", hostname));
         }
 
         if is_new || stability_changed {
@@ -318,6 +395,77 @@ impl Coordinator for CoordinatorService {
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn get_stats(
+        &self,
+        _request: Request<Empty>,
+    ) -> std::result::Result<Response<ClusterStats>, Status> {
+        let state = &self.0;
+        let plan = state.plan_tx.borrow().clone();
+
+        let mut nodes = Vec::with_capacity(state.nodes.len());
+
+        for entry in state.nodes.iter() {
+            let cap = entry.value();
+            let (start_layer, end_layer) = plan
+                .assignments
+                .iter()
+                .find(|a| a.node_id == cap.node_id)
+                .map(|a| (a.start_layer, a.end_layer))
+                .unwrap_or((0, 0));
+
+            let rpc_addr = state
+                .rpc_addrs
+                .get(&cap.node_id)
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+
+            let hostname = state
+                .hostnames
+                .get(&cap.node_id)
+                .map(|h| h.clone())
+                .unwrap_or_else(|| {
+                    cap.node_id
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("?")
+                        .to_string()
+                });
+
+            let used_ram = (end_layer.saturating_sub(start_layer) as u64)
+                .saturating_mul(state.bytes_per_layer);
+            nodes.push(NodeStats {
+                node_id: cap.node_id.as_bytes().to_vec(),
+                tokens_per_sec: cap.tokens_per_sec,
+                free_ram_bytes: cap.free_ram_bytes,
+                used_ram_bytes: used_ram,
+                reachable: cap.reachable,
+                stability: PbStability::from(cap.stability) as i32,
+                rpc_addr,
+                start_layer,
+                end_layer,
+                hostname,
+            });
+        }
+
+        let events: Vec<_> = state.events.lock().unwrap().iter().cloned().collect();
+
+        Ok(Response::new(ClusterStats {
+            llama_ready: state.llama_ready.load(Ordering::Relaxed),
+            model: state
+                .model
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            total_layers: state.total_layers,
+            llama_server_url: state.llama_server_url().unwrap_or_default(),
+            coordinator_hostname: state.coordinator_hostname.clone(),
+            bytes_per_layer: state.bytes_per_layer,
+            events,
+            nodes,
+        }))
+    }
 }
 
 async fn timeout_checker(state: Arc<CoordinatorState>) {
@@ -338,9 +486,11 @@ async fn timeout_checker(state: Arc<CoordinatorState>) {
             };
             if elapsed > state.heartbeat_timeout {
                 let id = entry.value().node_id;
+                let host = state.node_hostname(id);
                 entry.value_mut().reachable = false;
                 changed = true;
                 warn!("node {} heartbeat timed out", id);
+                state.log_event(format!("node {} timed out", host));
             }
         }
 
@@ -382,6 +532,18 @@ fn run_mdns_browse(state: Arc<CoordinatorState>, port: Option<u16>) -> Result<()
                                     state.rpc_addrs.insert(id, ring_addr);
                                 }
 
+                                let host = info
+                                    .get_property_val_str("hostname")
+                                    .map(|h| h.to_string())
+                                    .or_else(|| {
+                                        info.get_fullname().split('.').next().map(|h| h.to_string())
+                                    })
+                                    .unwrap_or_else(|| {
+                                        id.to_string().split('-').next().unwrap_or("?").to_string()
+                                    });
+                                state.hostnames.insert(id, host.clone());
+
+                                state.log_event(format!("node {} discovered", host));
                                 state.recompute_plan_or_empty();
                             }
                         }
@@ -390,11 +552,14 @@ fn run_mdns_browse(state: Arc<CoordinatorState>, port: Option<u16>) -> Result<()
                 ServiceEvent::ServiceRemoved(fullname, _) => {
                     let prefix = fullname.split('.').next().unwrap_or("");
                     if let Ok(id) = Uuid::parse_str(prefix) {
+                        let host = state.node_hostname(id);
                         state.addrs.remove(&id);
                         state.rpc_addrs.remove(&id);
+                        state.hostnames.remove(&id);
                         if let Some(mut entry) = state.nodes.get_mut(&id) {
                             entry.value_mut().reachable = false;
                         }
+                        state.log_event(format!("node {} left", host));
                         state.recompute_plan_or_empty();
                     }
                 }
@@ -440,6 +605,8 @@ async fn chat_completions(
     // If a model is configured and llama-server is ready, proxy to it.
     if state.model.is_some() {
         if let Some(url) = state.llama_server_url() {
+            state.log_event("generation started");
+
             let body = serde_json::json!({
                 "model": req.model,
                 "messages": req.messages,
@@ -452,22 +619,28 @@ async fn chat_completions(
                 .json(&body)
                 .send()
                 .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                .map_err(|_| {
+                    state.log_event("generation failed");
+                    StatusCode::BAD_GATEWAY
+                })?;
 
             if !response.status().is_success() {
+                state.log_event("generation failed");
                 return Err(StatusCode::BAD_GATEWAY);
             }
 
-            let json = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let json = response.json::<serde_json::Value>().await.map_err(|_| {
+                state.log_event("generation failed");
+                StatusCode::BAD_GATEWAY
+            })?;
+            state.log_event("generation completed");
             return Ok(Json(json));
         }
     }
 
     // Fallback to the legacy ring-transport path when no model is configured
     // or llama-server is not ready.
+    state.log_event("request routed to ring");
     let plan = state.plan_tx.borrow().clone();
     let entry = plan.entry_node().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 

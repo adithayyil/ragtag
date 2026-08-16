@@ -39,6 +39,20 @@ fn service_type() -> String {
     std::env::var("RAGTAG_SERVICE_TYPE").unwrap_or_else(|_| DEFAULT_SERVICE_TYPE.to_string())
 }
 
+fn system_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Command-line configuration for a `ragtag-node` instance.
 #[derive(Parser, Debug)]
 #[command(name = "ragtag-node", version)]
@@ -52,6 +66,9 @@ struct Args {
     /// Hostname or IP to advertise via mDNS.
     #[arg(long, default_value = "127.0.0.1")]
     advertise_host: String,
+    /// Hostname to report to the coordinator for display.
+    #[arg(long)]
+    hostname: Option<String>,
     /// URL of an external llama.cpp HTTP server (e.g. http://127.0.0.1:8080).
     /// When set, the node sends prompts to this server instead of using the
     /// no-op engine. The server must be started separately with the desired
@@ -292,6 +309,7 @@ fn advertise(
     listen_ip: IpAddr,
     port: u16,
     rpc_addr: SocketAddr,
+    hostname: &str,
 ) -> Result<()> {
     let mdns = ServiceDaemon::new().context("create mdns daemon")?;
 
@@ -302,15 +320,16 @@ fn advertise(
         ("free_ram_bytes", capability.free_ram_bytes.to_string()),
         ("stability", stability),
         ("rpc_addr", rpc_addr.to_string()),
+        ("hostname", hostname.to_string()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
 
-    let host = format!("{}.local.", node_id);
+    let host = format!("{}.local.", hostname);
     let info = ServiceInfo::new(
         &service_type(),
-        &node_id.to_string(),
+        hostname,
         &host,
         listen_ip,
         port,
@@ -339,6 +358,7 @@ async fn run_heartbeats(
     listen_addr: SocketAddr,
     rpc_addr: SocketAddr,
     heartbeat_secs: u64,
+    hostname: String,
 ) -> Result<()> {
     let mut timer = interval(Duration::from_secs(heartbeat_secs));
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -360,6 +380,10 @@ async fn run_heartbeats(
         let rpc_value = MetadataValue::try_from(rpc.as_str())
             .map_err(|_| anyhow::anyhow!("invalid rpc-addr metadata"))?;
         req.metadata_mut().insert("rpc-addr", rpc_value);
+
+        let host_value = MetadataValue::try_from(hostname.as_str())
+            .map_err(|_| anyhow::anyhow!("invalid hostname metadata"))?;
+        req.metadata_mut().insert("hostname", host_value);
 
         client.heartbeat(req).await.context("send heartbeat")?;
 
@@ -385,6 +409,7 @@ async fn watch_plans(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
     coordinator: SocketAddr,
     node_id: Uuid,
@@ -393,6 +418,7 @@ async fn heartbeat_loop(
     listen_addr: SocketAddr,
     rpc_addr: SocketAddr,
     heartbeat_secs: u64,
+    hostname: String,
 ) {
     let mut backoff = Duration::from_secs(1);
 
@@ -411,6 +437,7 @@ async fn heartbeat_loop(
                     listen_addr,
                     rpc_addr,
                     heartbeat_secs,
+                    hostname.clone(),
                 )
                 .await
                 {
@@ -465,6 +492,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let node_id = args.node_id.unwrap_or_else(Uuid::new_v4);
+    let hostname = args.hostname.clone().unwrap_or_else(system_hostname);
     let capability = build_capability(&args, node_id)?;
 
     let (plan_tx, plan_rx) = watch::channel(None);
@@ -491,6 +519,7 @@ async fn main() -> Result<()> {
         advertise_ip,
         listen_addr.port(),
         args.rpc_addr,
+        &hostname,
     )?;
 
     info!(%node_id, %listen_addr, rpc_addr = %args.rpc_addr, "node starting");
@@ -508,6 +537,7 @@ async fn main() -> Result<()> {
         listen_addr,
         args.rpc_addr,
         args.heartbeat_secs,
+        hostname,
     ));
     let server = tokio::spawn(run_server(listener, state));
 

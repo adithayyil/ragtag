@@ -38,8 +38,37 @@ message NodeId {
   bytes node_id = 1;
 }
 
+// Empty request/response.
+message Empty {}
+
 // Empty acknowledgement.
 message Ack {}
+
+// Per-node runtime information returned by the coordinator.
+message NodeStats {
+  bytes node_id = 1;
+  float tokens_per_sec = 2;
+  uint64 free_ram_bytes = 3;
+  bool reachable = 4;
+  Stability stability = 5;
+  string rpc_addr = 6; // "ip:port"
+  uint32 start_layer = 7;
+  uint32 end_layer = 8;
+  string hostname = 9;
+  uint64 used_ram_bytes = 10;
+}
+
+// Snapshot of the cluster state.
+message ClusterStats {
+  bool llama_ready = 1;
+  string model = 2;              // path to the GGUF model, or empty
+  uint32 total_layers = 3;
+  string llama_server_url = 4;   // "http://host:port" when ready, or empty
+  string coordinator_hostname = 6; // hostname of the coordinator machine
+  uint64 bytes_per_layer = 7;    // bytes used by the scheduler per layer
+  repeated string events = 8;    // recent coordinator events, oldest first
+  repeated NodeStats nodes = 5;
+}
 
 // One chunk of a split activation tensor.
 message ActivationChunk {
@@ -58,4 +87,5 @@ service RingTransport {
 service Coordinator {
   rpc Heartbeat(NodeCapability) returns (Ack);
   rpc WatchPlan(NodeId) returns (stream PartitionPlan);
+  rpc GetStats(Empty) returns (ClusterStats);
 }

@@ -6,6 +6,7 @@ members = [
   "crates/ragtag-proto",
   "crates/ragtag-node",
   "crates/ragtag-coordinator",
+  "crates/ragtag-chat",
   "xtask",
 ]
 

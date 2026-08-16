@@ -81,7 +81,15 @@
             pname = "ragtag";
             version = "0.1.0";
 
-            src = ./.;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./crates
+                ./xtask
+              ];
+            };
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -112,6 +120,7 @@
               mkdir -p $out/bin
               cp target/${pkgs.stdenv.hostPlatform.config}/release/ragtag-coordinator $out/bin/
               cp target/${pkgs.stdenv.hostPlatform.config}/release/ragtag-node $out/bin/
+              cp target/${pkgs.stdenv.hostPlatform.config}/release/ragtag-chat $out/bin/
               runHook postInstall
             '';
 

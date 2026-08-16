@@ -68,7 +68,10 @@ impl LlamaServerManager {
                         if let Some(mut old) = child.take() {
                             let _ = old.kill().await;
                             let _ = old.wait().await;
+                            self.state.log_event("engine stopped");
                         }
+
+                        self.state.log_event("engine restarting...");
 
                         match self.spawn(&args).await {
                             Ok(mut new_child) => {
@@ -82,6 +85,7 @@ impl LlamaServerManager {
                                             self.set_ready(true);
                                             child = Some(new_child);
                                             info!(url = %self.url(), "llama-server ready");
+                                            self.state.log_event("engine ready");
                                         }
                                         Ok(Err(e)) => {
                                             warn!("llama-server did not become ready: {}", e);
@@ -101,6 +105,7 @@ impl LlamaServerManager {
                                         let _ = new_child.kill().await;
                                         let _ = new_child.wait().await;
                                         self.set_ready(false);
+                                        self.state.log_event("engine stopped");
                                         continue;
                                     }
                                 }
@@ -118,6 +123,7 @@ impl LlamaServerManager {
                         if let Some(mut old) = child.take() {
                             let _ = old.kill().await;
                             let _ = old.wait().await;
+                            self.state.log_event("engine stopped");
                         }
                         last_args = None;
                         self.set_ready(false);
@@ -128,6 +134,7 @@ impl LlamaServerManager {
                     if let Some(mut old) = child.take() {
                         let _ = old.kill().await;
                         let _ = old.wait().await;
+                        self.state.log_event("engine stopped");
                     }
                     last_args = None;
                     self.set_ready(false);
