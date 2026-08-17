@@ -650,11 +650,12 @@ async fn chat_completions(
 
             if req.stream {
                 let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+                let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let stream = response.bytes_stream().map_err(std::io::Error::other);
-                    let mut reader =
-                        BufReader::new(StreamReader::new(stream));
+                    let mut reader = BufReader::new(StreamReader::new(stream));
                     let mut line = String::new();
+                    let mut failed = false;
 
                     loop {
                         line.clear();
@@ -675,8 +676,17 @@ async fn chat_completions(
                                     }
                                 }
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                failed = true;
+                                break;
+                            }
                         }
+                    }
+
+                    if failed {
+                        state.log_event("generation failed");
+                    } else {
+                        state.log_event("generation completed");
                     }
                 });
 

@@ -271,6 +271,7 @@ impl App {
 
     fn draw_chat(&self, f: &mut Frame, area: Rect) {
         let block = Block::default().title(" chat ").borders(Borders::ALL);
+        let inner = block.inner(area);
 
         let mut text = Vec::new();
         for msg in &self.messages {
@@ -288,15 +289,19 @@ impl App {
         let paragraph = Paragraph::new(Text::from(text))
             .block(block)
             .wrap(ratatui::widgets::Wrap { trim: true });
+        let total_lines = paragraph.line_count(inner.width);
+        let offset = total_lines.saturating_sub(inner.height as usize);
+        let paragraph = paragraph.scroll((offset as u16, 0));
         f.render_widget(paragraph, area);
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
         let block = Block::default().title(" activity ").borders(Borders::ALL);
-        let mut lines = self.activity.clone();
+        let mut lines = Vec::new();
         if let Some(stats) = &self.stats {
             lines.extend(stats.events.iter().cloned());
         }
+        lines.extend(self.activity.iter().cloned());
         let items: Vec<ListItem> = lines
             .iter()
             .rev()
