@@ -6,11 +6,17 @@
 //! local `llama-server` process.
 
 use anyhow::{Context, Result};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{sse::Event, IntoResponse, Response as AxumResponse, Sse},
+    routing::post,
+    Json, Router,
+};
 use chrono::Local;
 use clap::Parser;
 use dashmap::DashMap;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use ragtag_core::{NodeCapability, PartitionPlan};
 use ragtag_proto::pb::{
@@ -31,10 +37,12 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
-use tokio_stream::wrappers::WatchStream;
+use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+use tokio_util::io::StreamReader;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -613,21 +621,16 @@ struct ChatCompletionRequest {
 async fn chat_completions(
     State(state): State<Arc<CoordinatorState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
-    if req.stream {
-        return Err(StatusCode::NOT_IMPLEMENTED);
-    }
-
+) -> std::result::Result<AxumResponse, StatusCode> {
     // If a model is configured and llama-server is ready, proxy to it.
     if state.model.is_some() {
         if let Some(url) = state.llama_server_url() {
             state.log_event("generation started");
 
-            let mut body = serde_json::to_value(&req).map_err(|_| {
+            let body = serde_json::to_value(&req).map_err(|_| {
                 state.log_event("generation failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-            body["stream"] = serde_json::Value::Bool(false);
 
             let response = state
                 .llama_client
@@ -645,13 +648,52 @@ async fn chat_completions(
                 return Err(StatusCode::BAD_GATEWAY);
             }
 
+            if req.stream {
+                let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+                tokio::spawn(async move {
+                    let stream = response.bytes_stream().map_err(std::io::Error::other);
+                    let mut reader =
+                        BufReader::new(StreamReader::new(stream));
+                    let mut line = String::new();
+
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let trimmed = line.trim();
+                                if let Some(data) = trimmed.strip_prefix("data: ") {
+                                    if data == "[DONE]" {
+                                        break;
+                                    }
+                                    if tx
+                                        .send(Ok(Event::default().data(data)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                return Ok(Sse::new(ReceiverStream::new(rx)).into_response());
+            }
+
             let json = response.json::<serde_json::Value>().await.map_err(|_| {
                 state.log_event("generation failed");
                 StatusCode::BAD_GATEWAY
             })?;
             state.log_event("generation completed");
-            return Ok(Json(json));
+            return Ok(Json(json).into_response());
         }
+    }
+
+    if req.stream {
+        return Err(StatusCode::NOT_IMPLEMENTED);
     }
 
     // Fallback to the legacy ring-transport path when no model is configured
@@ -706,7 +748,8 @@ async fn chat_completions(
             "message": { "role": "assistant", "content": content },
             "finish_reason": "stop"
         }]
-    })))
+    }))
+    .into_response())
 }
 
 async fn run_http_server(listener: TcpListener, state: Arc<CoordinatorState>) -> Result<()> {

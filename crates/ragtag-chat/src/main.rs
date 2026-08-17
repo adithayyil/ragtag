@@ -6,6 +6,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, ExecutableCommand};
+use futures::TryStreamExt;
 use ragtag_proto::pb::{ClusterStats, Empty};
 use ragtag_proto::CoordinatorClient;
 use ratatui::backend::CrosstermBackend;
@@ -18,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{self, stdout, Write};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio_util::io::StreamReader;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -63,10 +66,31 @@ struct AssistantMessage {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct ChatCompletionChunk {
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChunkChoice {
+    delta: DeltaMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeltaMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
 enum AppEvent {
     Key(CrosstermEvent),
     Stats(ClusterStats),
     ChatResponse(Message),
+    StreamStarted,
+    StreamToken(String),
+    StreamDone,
+    StreamError(String),
     Error(String),
     Connected,
 }
@@ -345,6 +369,108 @@ async fn send_chat(
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
+        "stream": true,
+    });
+
+    let resp = match client
+        .post(format!("{}/v1/chat/completions", url.trim_end_matches('/')))
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED => {
+            // Coordinator does not support streaming without a ready llama-server.
+            // Fall back to a one-shot request for compatibility.
+            let _ = tx.try_send(AppEvent::StreamError("streaming not available, retrying".into())).ok();
+            send_chat_non_stream(client, url, model, max_tokens, messages, tx).await;
+            return;
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let _ = tx
+                .try_send(AppEvent::StreamError(format!("HTTP {}: {}", status, text)))
+                .ok();
+            return;
+        }
+        Err(e) => {
+            let _ = tx
+                .try_send(AppEvent::StreamError(format!("request failed: {}", e)))
+                .ok();
+            return;
+        }
+    };
+
+    let _ = tx.try_send(AppEvent::StreamStarted).ok();
+
+    let stream = resp.bytes_stream().map_err(std::io::Error::other);
+    let mut reader = BufReader::new(StreamReader::new(stream));
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if let Some(data) = trimmed.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    match serde_json::from_str::<ChatCompletionChunk>(data) {
+                        Ok(chunk) => {
+                            if let Some(content) = chunk
+                                .choices
+                                .first()
+                                .and_then(|c| c.delta.content.as_deref())
+                                .filter(|s| !s.is_empty())
+                            {
+                                let _ = tx
+                                    .try_send(AppEvent::StreamToken(content.to_string()))
+                                    .ok();
+                            }
+                            if chunk
+                                .choices
+                                .first()
+                                .and_then(|c| c.finish_reason.as_ref())
+                                .is_some()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .try_send(AppEvent::StreamError(format!("stream parse: {}", e)))
+                                .ok();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .try_send(AppEvent::StreamError(format!("stream read: {}", e)))
+                    .ok();
+                break;
+            }
+        }
+    }
+
+    let _ = tx.try_send(AppEvent::StreamDone).ok();
+}
+
+async fn send_chat_non_stream(
+    client: Client,
+    url: String,
+    model: String,
+    max_tokens: u32,
+    messages: Vec<Message>,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    let request = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
     });
 
     match client
@@ -496,9 +622,50 @@ async fn run_app(mut app: App) -> Result<()> {
                         .join(" ")
                 ));
                 app.generating = false;
-                if !app.generating {
-                    app.status = "ready";
+                app.status = "ready";
+            }
+            Some(AppEvent::StreamStarted) => {
+                app.messages.push(Message {
+                    role: "assistant".into(),
+                    content: String::new(),
+                });
+                app.status = "generating";
+            }
+            Some(AppEvent::StreamToken(token)) => {
+                if app.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+                    app.messages.push(Message {
+                        role: "assistant".into(),
+                        content: String::new(),
+                    });
                 }
+                if let Some(last) = app.messages.last_mut() {
+                    last.content.push_str(&token);
+                }
+                app.status = "generating";
+            }
+            Some(AppEvent::StreamDone) => {
+                if let Some(last) = app.messages.last() {
+                    app.log(format!(
+                        "assistant: {}",
+                        last.content
+                            .split_whitespace()
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                app.generating = false;
+                app.status = "ready";
+            }
+            Some(AppEvent::StreamError(e)) => {
+                app.log(format!("error: {}", e));
+                if let Some(last) = app.messages.last() {
+                    if last.role == "assistant" && last.content.is_empty() {
+                        app.messages.pop();
+                    }
+                }
+                app.generating = false;
+                app.status = "ready";
             }
             Some(AppEvent::Error(e)) => {
                 app.log(format!("error: {}", e));
