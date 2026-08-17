@@ -162,12 +162,12 @@ impl App {
 
         let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main[0]);
 
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main[1]);
 
         self.draw_cluster(f, top[0]);
@@ -285,7 +285,9 @@ impl App {
             ]));
         }
 
-        let paragraph = Paragraph::new(Text::from(text)).block(block);
+        let paragraph = Paragraph::new(Text::from(text))
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(paragraph, area);
     }
 
