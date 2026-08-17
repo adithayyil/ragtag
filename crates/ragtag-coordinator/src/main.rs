@@ -183,6 +183,10 @@ impl CoordinatorState {
             addresses.insert(node.node_id, addr);
         }
 
+        // Keep the schedule deterministic across recomputations so the
+        // llama-server --rpc/--tensor-split argument order is stable.
+        devices.sort_by_key(|d| d.node_id);
+
         let input = ScheduledInput::new(self.coordinator_id, &devices, &addresses)?;
         let cost = LinearCostModel::new(self.bytes_per_layer, self.seconds_per_layer);
         let plan = solve(self.total_layers, &input, &cost)?;

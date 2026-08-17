@@ -66,7 +66,9 @@ impl LlamaServerManager {
 
             match self.state.rpc_plan(&plan) {
                 Ok(args) if !args.is_empty() => {
-                    if last_args.as_ref() != Some(&args) {
+                    if last_args.as_ref() == Some(&args) {
+                        // Same RPC worker set as the running process; keep it.
+                    } else {
                         if let Some(mut old) = child.take() {
                             let _ = old.kill().await;
                             let _ = old.wait().await;
@@ -77,46 +79,33 @@ impl LlamaServerManager {
 
                         match self.spawn(&args).await {
                             Ok(mut new_child) => {
-                                last_args = Some(args.clone());
+                                last_args = Some(args);
 
-                                let wait = tokio::spawn(Self::wait_ready(
+                                match Self::wait_ready(
                                     self.state.llama_client.clone(),
                                     self.url(),
-                                ));
-                                tokio::select! {
-                                    res = wait => match res {
-                                        Ok(Ok(())) => {
-                                            self.set_ready(true);
-                                            child = Some(new_child);
-                                            info!(url = %self.url(), "llama-server ready");
-                                            self.state.log_event("engine ready");
-                                        }
-                                        Ok(Err(e)) => {
-                                            warn!("llama-server did not become ready: {}", e);
-                                            let _ = new_child.kill().await;
-                                            let _ = new_child.wait().await;
-                                            self.set_ready(false);
-                                        }
-                                        Err(e) => {
-                                            warn!("llama-server readiness task panicked: {}", e);
-                                            let _ = new_child.kill().await;
-                                            let _ = new_child.wait().await;
-                                            self.set_ready(false);
-                                        }
-                                    },
-                                    _ = self.plan_rx.changed() => {
-                                        warn!("plan changed while waiting for llama-server; restarting");
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        self.set_ready(true);
+                                        child = Some(new_child);
+                                        info!(url = %self.url(), "llama-server ready");
+                                        self.state.log_event("engine ready");
+                                    }
+                                    Err(e) => {
+                                        warn!("llama-server did not become ready: {}", e);
                                         let _ = new_child.kill().await;
                                         let _ = new_child.wait().await;
                                         self.set_ready(false);
-                                        self.state.log_event("engine stopped");
-                                        continue;
+                                        last_args = None;
                                     }
                                 }
                             }
                             Err(e) => {
                                 warn!("failed to start llama-server: {}", e);
                                 self.set_ready(false);
+                                last_args = None;
                             }
                         }
                     }
@@ -147,6 +136,36 @@ impl LlamaServerManager {
 
             if self.plan_rx.changed().await.is_err() {
                 break;
+            }
+
+            // A change was signalled. If the new plan yields the same RPC args,
+            // keep the current llama-server and wait again.
+            let new_plan = self.plan_rx.borrow().clone();
+            match self.state.rpc_plan(&new_plan) {
+                Ok(new_args) if !new_args.is_empty() => {
+                    if last_args.as_ref() == Some(&new_args) {
+                        continue;
+                    }
+                    // Different workers: kill the current process and respawn.
+                    if let Some(mut old) = child.take() {
+                        let _ = old.kill().await;
+                        let _ = old.wait().await;
+                        self.state.log_event("engine stopped");
+                    }
+                    self.set_ready(false);
+                    last_args = None;
+                    continue;
+                }
+                _ => {
+                    if let Some(mut old) = child.take() {
+                        let _ = old.kill().await;
+                        let _ = old.wait().await;
+                        self.state.log_event("engine stopped");
+                    }
+                    self.set_ready(false);
+                    last_args = None;
+                    continue;
+                }
             }
         }
 
