@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -7,6 +7,7 @@ use crossterm::terminal::{
 };
 use crossterm::{cursor, ExecutableCommand};
 use futures::TryStreamExt;
+use ragtag_core::net::{create_mdns_daemon, discover_coordinator};
 use ragtag_proto::pb::{ClusterStats, Empty};
 use ragtag_proto::CoordinatorClient;
 use ratatui::backend::CrosstermBackend;
@@ -29,11 +30,13 @@ use uuid::Uuid;
 #[command(name = "ragtag-chat")]
 #[command(about = "TUI chat client for ragtag")]
 struct Args {
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    url: String,
+    /// Coordinator HTTP base URL. If omitted, discover via mDNS.
+    #[arg(long)]
+    url: Option<String>,
 
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
-    grpc: String,
+    /// Coordinator gRPC endpoint URL. If omitted, discover via mDNS.
+    #[arg(long)]
+    grpc: Option<String>,
 
     #[arg(long, default_value = "tinyllama")]
     model: String,
@@ -43,6 +46,10 @@ struct Args {
 
     #[arg(long, default_value_t = 128)]
     max_tokens: u32,
+
+    /// mDNS discovery timeout in seconds.
+    #[arg(long, default_value_t = 3)]
+    mdns_timeout_secs: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -110,7 +117,7 @@ struct App {
 }
 
 impl App {
-    fn new(args: Args, client: Client) -> Self {
+    fn new(args: Args, url: String, grpc: String, client: Client) -> Self {
         let mut messages = Vec::new();
         if let Some(s) = args.system {
             messages.push(Message {
@@ -120,8 +127,8 @@ impl App {
         }
 
         Self {
-            url: args.url,
-            grpc: args.grpc,
+            url,
+            grpc,
             model: args.model,
             max_tokens: args.max_tokens,
             messages,
@@ -706,10 +713,39 @@ async fn run_app(mut app: App) -> Result<()> {
     Ok(())
 }
 
+fn discover_endpoints(
+    timeout: Duration,
+    explicit_url: Option<String>,
+    explicit_grpc: Option<String>,
+) -> Result<(String, String)> {
+    if explicit_url.is_some() && explicit_grpc.is_some() {
+        return Ok((explicit_url.unwrap(), explicit_grpc.unwrap()));
+    }
+
+    let mdns = create_mdns_daemon().context("create mdns daemon")?;
+    let discovered = discover_coordinator(&mdns, timeout)?;
+
+    if let Some(coord) = discovered {
+        let grpc = explicit_grpc.unwrap_or_else(|| format!("http://{}", coord.grpc));
+        let http = coord
+            .http
+            .map(|a| format!("http://{}", a))
+            .unwrap_or_else(|| format!("http://{}:3000", coord.grpc.ip()));
+        let url = explicit_url.unwrap_or(http);
+        return Ok((url, grpc));
+    }
+
+    let url = explicit_url.unwrap_or_else(|| "http://127.0.0.1:3000".into());
+    let grpc = explicit_grpc.unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    Ok((url, grpc))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let client = Client::new();
-    let app = App::new(args, client);
+    let timeout = Duration::from_secs(args.mdns_timeout_secs);
+    let (url, grpc) = discover_endpoints(timeout, args.url.clone(), args.grpc.clone())?;
+    let app = App::new(args, url, grpc, client);
     run_app(app).await
 }

@@ -12,6 +12,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// Network discovery helpers (mDNS, local address selection).
+pub mod net;
+
 /// Describes what a node can currently offer to the pipeline.
 ///
 /// `tokens_per_sec` is a node-local throughput estimate. The concrete unit is

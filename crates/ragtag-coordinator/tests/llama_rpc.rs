@@ -81,6 +81,7 @@ async fn spawn_worker(port: u16) -> Result<Child> {
 async fn spawn_coordinator(
     model: &Path,
     llama_port: u16,
+    service_type: &str,
 ) -> Result<(Child, SocketAddr, SocketAddr, mpsc::Receiver<String>)> {
     let mut child = Command::new(COORDINATOR_EXE)
         .arg("--total-layers")
@@ -103,7 +104,11 @@ async fn spawn_coordinator(
         .arg("llama-server")
         .arg("--coordinator-id")
         .arg("00000000-0000-0000-0000-000000000000")
+        .arg("--advertise-host")
+        .arg("127.0.0.1")
         .env("RUST_LOG", "info")
+        .env("RAGTAG_SERVICE_TYPE", service_type)
+        .env("RAGTAG_COORD_SERVICE_TYPE", service_type)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -212,6 +217,14 @@ async fn llama_server_rpc_split_and_completion() -> Result<()> {
         );
     }
 
+    let short_id = Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(6)
+        .collect::<String>();
+    let service_type = format!("_ragtag-{}._tcp.local.", short_id);
+
     let rpc_port_a = find_free_port()?;
     let rpc_port_b = find_free_port()?;
     let llama_port = find_free_port()?;
@@ -223,7 +236,7 @@ async fn llama_server_rpc_split_and_completion() -> Result<()> {
     let mut worker_b = spawn_worker(rpc_port_b).await?;
 
     let (mut coordinator, grpc_addr, http_addr, mut rx) =
-        spawn_coordinator(&model, llama_port).await?;
+        spawn_coordinator(&model, llama_port, &service_type).await?;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{}", grpc_addr))
         .context("build endpoint")?

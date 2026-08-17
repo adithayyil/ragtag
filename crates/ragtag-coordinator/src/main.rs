@@ -18,6 +18,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt, TryStreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use ragtag_core::net::{coord_service_type, first_local_ipv4};
 use ragtag_core::{NodeCapability, PartitionPlan};
 use ragtag_proto::pb::{
     coordinator_server::{Coordinator, CoordinatorServer},
@@ -120,6 +121,10 @@ pub struct Args {
     /// Hostname to report in cluster stats. Defaults to the system hostname.
     #[arg(long)]
     hostname: Option<String>,
+    /// IP or "auto" to advertise for coordinator discovery. "auto" picks the
+    /// first usable local IPv4 address. Defaults to "auto".
+    #[arg(long, default_value = "auto")]
+    advertise_host: String,
 }
 
 /// Shared coordinator state.
@@ -522,12 +527,7 @@ async fn timeout_checker(state: Arc<CoordinatorState>) {
     }
 }
 
-fn run_mdns_browse(state: Arc<CoordinatorState>, port: Option<u16>) -> Result<()> {
-    let mdns = match port {
-        Some(p) => ServiceDaemon::new_with_port(p).context("create mdns daemon with port")?,
-        None => ServiceDaemon::new().context("create mdns daemon")?,
-    };
-
+fn run_mdns_browse(state: Arc<CoordinatorState>, mdns: ServiceDaemon) -> Result<()> {
     let receiver = mdns.browse(&service_type()).context("browse mdns")?;
 
     std::thread::spawn(move || {
@@ -590,6 +590,37 @@ fn run_mdns_browse(state: Arc<CoordinatorState>, port: Option<u16>) -> Result<()
         }
     });
 
+    Ok(())
+}
+
+fn register_coordinator(
+    mdns: &ServiceDaemon,
+    hostname: &str,
+    advertise_ip: IpAddr,
+    grpc_port: u16,
+    http_addr: SocketAddr,
+) -> Result<()> {
+    let properties: std::collections::HashMap<String, String> = [
+        ("hostname", hostname.to_string()),
+        ("grpc", SocketAddr::new(advertise_ip, grpc_port).to_string()),
+        ("http", http_addr.to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+
+    let host = format!("{}.local.", hostname);
+    let info = mdns_sd::ServiceInfo::new(
+        &coord_service_type(),
+        hostname,
+        &host,
+        advertise_ip,
+        grpc_port,
+        properties,
+    )
+    .context("create coordinator mdns service info")?;
+
+    mdns.register(info).context("register coordinator mdns service")?;
     Ok(())
 }
 
@@ -779,6 +810,24 @@ async fn main() -> Result<()> {
     let (state, plan_rx) = CoordinatorState::new(&args);
     let state = Arc::new(state);
 
+    let mdns = match args.mdns_port {
+        Some(p) => ServiceDaemon::new_with_port(p).context("create mdns daemon with port")?,
+        None => ServiceDaemon::new().context("create mdns daemon")?,
+    };
+
+    let hostname = args.hostname.clone().unwrap_or_else(system_hostname);
+    let advertise_ip: IpAddr = if args.advertise_host.eq_ignore_ascii_case("auto")
+        || args.advertise_host == "0.0.0.0"
+    {
+        first_local_ipv4()
+            .map(IpAddr::V4)
+            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+    } else {
+        args.advertise_host
+            .parse()
+            .context("parse advertise-host as IP")?
+    };
+
     let grpc_listener = TcpListener::bind(args.grpc)
         .await
         .context("bind gRPC socket")?;
@@ -789,10 +838,18 @@ async fn main() -> Result<()> {
         .context("bind HTTP socket")?;
     let http_addr = http_listener.local_addr()?;
 
-    info!(%grpc_addr, %http_addr, "coordinator starting");
+    register_coordinator(
+        &mdns,
+        &hostname,
+        advertise_ip,
+        grpc_addr.port(),
+        SocketAddr::new(advertise_ip, http_addr.port()),
+    )?;
+
+    info!(%grpc_addr, %http_addr, %advertise_ip, "coordinator starting");
     info!(coordinator_id = %state.coordinator_id, "coordinator id");
 
-    run_mdns_browse(state.clone(), args.mdns_port)?;
+    run_mdns_browse(state.clone(), mdns.clone())?;
 
     let grpc = tokio::spawn(run_grpc_server(grpc_listener, state.clone()));
     let http = tokio::spawn(run_http_server(http_listener, state.clone()));
@@ -812,6 +869,9 @@ async fn main() -> Result<()> {
     } else {
         tokio::spawn(async { std::future::pending::<()>().await })
     };
+
+    // Keep the mDNS daemon alive for the lifetime of the process.
+    let _mdns = mdns;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("shutting down"),

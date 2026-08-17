@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures::{Stream, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use ragtag_core::net::{create_mdns_daemon, discover_coordinator, resolve_advertise_ip};
 use ragtag_core::{NodeCapability, PartitionPlan, Stability};
 use ragtag_proto::pb::{
     coordinator_client::CoordinatorClient,
@@ -17,13 +18,13 @@ use ragtag_proto::pb::{
     ActivationChunk,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::metadata::MetadataValue;
@@ -57,14 +58,18 @@ fn system_hostname() -> String {
 #[derive(Parser, Debug)]
 #[command(name = "ragtag-node", version)]
 struct Args {
-    /// Socket address the ring transport server should bind to.
-    #[arg(long, default_value = "127.0.0.1:0")]
+    /// Socket address the ring transport server should bind to. Use 0.0.0.0 to
+    /// accept both LAN and reverse-forwarded tunnel connections.
+    #[arg(long, default_value = "0.0.0.0:0")]
     listen: SocketAddr,
-    /// Coordinator gRPC address.
-    #[arg(long)]
+    /// Coordinator gRPC address fallback when mDNS discovery finds no local
+    /// coordinator.
+    #[arg(long, default_value = "127.0.0.1:50051")]
     coordinator: SocketAddr,
-    /// Hostname or IP to advertise via mDNS.
-    #[arg(long, default_value = "127.0.0.1")]
+    /// IP or "auto" to advertise via mDNS and heartbeats. "auto" picks the
+    /// local IP on the same subnet as the discovered coordinator, falling back
+    /// to 127.0.0.1 for tunnel mode.
+    #[arg(long, default_value = "auto")]
     advertise_host: String,
     /// Hostname to report to the coordinator for display.
     #[arg(long)]
@@ -307,16 +312,14 @@ fn build_engine(args: &Args) -> Result<Arc<dyn Engine + Send + Sync>> {
     Ok(Arc::new(NoopEngine))
 }
 
-fn advertise(
+fn build_service_info(
     node_id: Uuid,
     capability: &NodeCapability,
-    listen_ip: IpAddr,
-    port: u16,
+    advertise_ip: IpAddr,
+    listen_port: u16,
     rpc_addr: SocketAddr,
     hostname: &str,
-) -> Result<()> {
-    let mdns = ServiceDaemon::new().context("create mdns daemon")?;
-
+) -> Result<ServiceInfo> {
     let stability = format!("{:?}", capability.stability).to_lowercase();
     let properties: HashMap<String, String> = [
         ("node_id", node_id.to_string()),
@@ -331,36 +334,46 @@ fn advertise(
     .collect();
 
     let host = format!("{}.local.", hostname);
-    let info = ServiceInfo::new(
+    ServiceInfo::new(
         &service_type(),
         hostname,
         &host,
-        listen_ip,
-        port,
+        advertise_ip,
+        listen_port,
         properties,
     )
-    .context("create mdns service info")?;
+    .context("create mdns service info")
+}
 
+fn advertise(
+    mdns: &ServiceDaemon,
+    node_id: Uuid,
+    capability: &NodeCapability,
+    advertise_ip: IpAddr,
+    listen_port: u16,
+    rpc_addr: SocketAddr,
+    hostname: &str,
+) -> Result<String> {
+    let info = build_service_info(
+        node_id,
+        capability,
+        advertise_ip,
+        listen_port,
+        rpc_addr,
+        hostname,
+    )?;
+    let fullname = info.get_fullname().to_string();
     mdns.register(info).context("register mdns service")?;
-
-    // The mDNS daemon stops when its handle is dropped, so keep it alive in a
-    // background thread.
-    std::thread::spawn(move || {
-        let _keep = mdns;
-        loop {
-            std::thread::sleep(Duration::from_secs(60));
-        }
-    });
-
-    Ok(())
+    Ok(fullname)
 }
 
 async fn run_heartbeats(
     mut client: CoordinatorClient<tonic::transport::Channel>,
     capability: NodeCapability,
     node_id: Uuid,
-    listen_addr: SocketAddr,
-    rpc_addr: SocketAddr,
+    advertise_rx: watch::Receiver<(SocketAddr, IpAddr)>,
+    listen_port: u16,
+    rpc_port: u16,
     heartbeat_secs: u64,
     hostname: String,
 ) -> Result<()> {
@@ -370,18 +383,20 @@ async fn run_heartbeats(
     loop {
         timer.tick().await;
 
+        let (_, advertise_ip) = *advertise_rx.borrow();
+
         let mut cap = capability.clone();
         cap.last_heartbeat = Instant::now();
 
         let mut req = Request::new(ragtag_proto::pb::NodeCapability::from(cap));
 
-        let ring_addr = listen_addr.to_string();
+        let ring_addr = SocketAddr::new(advertise_ip, listen_port).to_string();
         let ring_value = MetadataValue::try_from(ring_addr.as_str())
             .map_err(|_| anyhow::anyhow!("invalid ring-addr metadata"))?;
         req.metadata_mut().insert("ring-addr", ring_value);
 
-        let rpc = rpc_addr.to_string();
-        let rpc_value = MetadataValue::try_from(rpc.as_str())
+        let rpc_addr = SocketAddr::new(advertise_ip, rpc_port).to_string();
+        let rpc_value = MetadataValue::try_from(rpc_addr.as_str())
             .map_err(|_| anyhow::anyhow!("invalid rpc-addr metadata"))?;
         req.metadata_mut().insert("rpc-addr", rpc_value);
 
@@ -415,60 +430,207 @@ async fn watch_plans(
 
 #[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
-    coordinator: SocketAddr,
+    mut coordinator_rx: watch::Receiver<(SocketAddr, IpAddr)>,
+    rediscover: Arc<Notify>,
     node_id: Uuid,
     capability: NodeCapability,
     plan_tx: watch::Sender<Option<PartitionPlan>>,
-    listen_addr: SocketAddr,
-    rpc_addr: SocketAddr,
+    listen_port: u16,
+    rpc_port: u16,
     heartbeat_secs: u64,
     hostname: String,
 ) {
     let mut backoff = Duration::from_secs(1);
 
     loop {
+        let (coordinator, _) = *coordinator_rx.borrow();
         let addr = format!("http://{}", coordinator);
+
         match CoordinatorClient::connect(addr).await {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                let watch_client = client.clone();
-                let watch = tokio::spawn(watch_plans(watch_client, node_id, plan_tx.clone()));
 
-                if let Err(e) = run_heartbeats(
+                let watch_client = client.clone();
+                let mut watch = tokio::spawn(watch_plans(watch_client, node_id, plan_tx.clone()));
+
+                let advertise_rx = coordinator_rx.clone();
+                let mut heartbeats = tokio::spawn(run_heartbeats(
                     client,
                     capability.clone(),
                     node_id,
-                    listen_addr,
-                    rpc_addr,
+                    advertise_rx,
+                    listen_port,
+                    rpc_port,
                     heartbeat_secs,
                     hostname.clone(),
-                )
-                .await
-                {
-                    warn!(%node_id, "heartbeat loop ended: {}", e);
+                ));
+
+                let changed = coordinator_rx.changed();
+                tokio::pin!(changed);
+                tokio::select! {
+                    result = &mut heartbeats => {
+                        if let Err(e) = result {
+                            warn!(%node_id, "heartbeat loop ended: {}", e);
+                        }
+                    }
+                    result = &mut watch => {
+                        if let Err(e) = result {
+                            warn!(%node_id, "watch plan loop ended: {}", e);
+                        }
+                    }
+                    _ = &mut changed => {
+                        info!(%node_id, "coordinator selection changed; reconnecting");
+                    }
                 }
 
                 watch.abort();
+                heartbeats.abort();
             }
             Err(e) => {
                 warn!(%node_id, "failed to connect to coordinator {}: {}", coordinator, e);
             }
         }
 
+        rediscover.notify_one();
+
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, Duration::from_secs(60));
     }
 }
 
+fn is_local_coord(coord: SocketAddr) -> bool {
+    matches!(coord.ip(), IpAddr::V4(v4) if ragtag_core::net::is_local_ipv4(v4))
+}
+
+fn coord_score(coord: SocketAddr) -> (bool, std::cmp::Reverse<String>) {
+    (is_local_coord(coord), std::cmp::Reverse(coord.to_string()))
+}
+
+async fn tcp_reachable(addr: SocketAddr, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rediscover_loop(
+    mdns: ServiceDaemon,
+    coordinator_tx: watch::Sender<(SocketAddr, IpAddr)>,
+    coordinator_rx: watch::Receiver<(SocketAddr, IpAddr)>,
+    rediscover: Arc<Notify>,
+    fullname: Arc<std::sync::Mutex<Option<String>>>,
+    fallback: SocketAddr,
+    advertise_host: String,
+    node_id: Uuid,
+    capability: NodeCapability,
+    hostname: String,
+    listen_port: u16,
+    rpc_port: u16,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let triggered = tokio::select! {
+            _ = rediscover.notified() => true,
+            _ = interval.tick() => false,
+        };
+
+        let discovered = discover_coordinator(&mdns, Duration::from_secs(2)).ok().flatten();
+
+        let (mut best_coord, mut best_ip) = {
+            let (cur_coord, cur_ip) = *coordinator_rx.borrow();
+            (cur_coord, cur_ip)
+        };
+
+        if let Some(d) = discovered {
+            if tcp_reachable(d.grpc, Duration::from_millis(500)).await {
+                let coord_ip = match d.grpc.ip() {
+                    IpAddr::V4(v4) if ragtag_core::net::is_local_ipv4(v4) => Some(v4),
+                    _ => None,
+                };
+                let advertise_ip = resolve_advertise_ip(&advertise_host, coord_ip)
+                    .unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
+                best_coord = d.grpc;
+                best_ip = IpAddr::V4(advertise_ip);
+            }
+        }
+
+        // If we were triggered by a connection failure and the discovered
+        // coordinator was not reachable, fall back to the configured address.
+        if triggered && !tcp_reachable(best_coord, Duration::from_millis(500)).await {
+            let advertise_ip = resolve_advertise_ip(&advertise_host, None)
+                .unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
+            best_coord = fallback;
+            best_ip = IpAddr::V4(advertise_ip);
+        }
+
+        let (cur_coord, cur_ip) = *coordinator_rx.borrow();
+        let best_score = coord_score(best_coord);
+        let cur_score = coord_score(cur_coord);
+
+        let should_switch = if triggered {
+            best_coord != cur_coord || best_ip != cur_ip
+        } else {
+            // Periodic checks only upgrade locality to avoid flapping between
+            // equally good coordinators.
+            (best_score > cur_score && best_coord != cur_coord)
+                || (best_coord == cur_coord && best_ip != cur_ip)
+        };
+
+        if should_switch {
+            info!(
+                %node_id,
+                old_coordinator = %cur_coord,
+                new_coordinator = %best_coord,
+                old_advertise = %cur_ip,
+                new_advertise = %best_ip,
+                "switching coordinator"
+            );
+
+            if let Err(e) = coordinator_tx.send((best_coord, best_ip)) {
+                warn!(%node_id, "coordinator watch closed: {}", e);
+                return;
+            }
+
+            // Re-register mDNS if our advertised IP changed.
+            if best_ip != cur_ip {
+                let new_rpc = SocketAddr::new(best_ip, rpc_port);
+                if let Ok(info) = build_service_info(
+                    node_id,
+                    &capability,
+                    best_ip,
+                    listen_port,
+                    new_rpc,
+                    &hostname,
+                ) {
+                    let new_fullname = info.get_fullname().to_string();
+                    {
+                        let mut guard = fullname.lock().unwrap();
+                        if let Some(old) = guard.as_deref() {
+                            let _ = mdns.unregister(old);
+                        }
+                        *guard = Some(new_fullname);
+                    }
+                    let _ = mdns.register(info);
+                }
+            }
+        }
+    }
+}
+
 async fn run_rpc_server(
     binary: &str,
-    host: IpAddr,
     port: u16,
     device: &str,
 ) -> Result<tokio::process::Child> {
+    // Bind on 0.0.0.0 so we can accept both direct LAN connections and
+    // reverse-forwarded tunnel connections (which land on 127.0.0.1).
     let mut child = tokio::process::Command::new(binary)
         .arg("--host")
-        .arg(host.to_string())
+        .arg("0.0.0.0")
         .arg("--port")
         .arg(port.to_string())
         .arg("--device")
@@ -504,6 +666,21 @@ async fn main() -> Result<()> {
     let hostname = args.hostname.clone().unwrap_or_else(system_hostname);
     let capability = build_capability(&args, node_id)?;
 
+    // Reuse one mDNS daemon for discovery and advertisement.
+    let mdns = create_mdns_daemon().context("create mdns daemon")?;
+
+    let discovered = discover_coordinator(&mdns, Duration::from_secs(3))?;
+
+    let coordinator_addr = discovered.as_ref().map(|d| d.grpc).unwrap_or(args.coordinator);
+    let coord_ip = discovered.as_ref().and_then(|d| match d.grpc.ip() {
+        IpAddr::V4(v4) if ragtag_core::net::is_local_ipv4(v4) => Some(v4),
+        _ => None,
+    });
+
+    let advertise_ip = resolve_advertise_ip(&args.advertise_host, coord_ip)
+        .unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
+    let advertise_ip = IpAddr::V4(advertise_ip);
+
     let (plan_tx, plan_rx) = watch::channel(None);
     let engine = build_engine(&args)?;
 
@@ -511,6 +688,7 @@ async fn main() -> Result<()> {
         .await
         .context("bind ring transport socket")?;
     let listen_addr = listener.local_addr()?;
+    let listen_port = listen_addr.port();
 
     let state = NodeState {
         node_id,
@@ -518,41 +696,64 @@ async fn main() -> Result<()> {
         plan: Arc::new(plan_rx),
     };
 
-    let advertise_ip: IpAddr = args
-        .advertise_host
-        .parse()
-        .context("parse advertise-host as IP")?;
-    advertise(
+    let rpc_port = args.rpc_addr.port();
+    let rpc_advertise_addr = SocketAddr::new(advertise_ip, rpc_port);
+    let fullname = Arc::new(std::sync::Mutex::new(Some(advertise(
+        &mdns,
         node_id,
         &capability,
         advertise_ip,
-        listen_addr.port(),
-        args.rpc_addr,
+        listen_port,
+        rpc_advertise_addr,
         &hostname,
-    )?;
+    )?)));
 
-    info!(%node_id, %listen_addr, rpc_addr = %args.rpc_addr, "node starting");
+    info!(%node_id, %listen_addr, advertise_ip = %advertise_ip, rpc_port = %rpc_port, coordinator = %coordinator_addr, "node starting");
+
+    let (coordinator_tx, coordinator_rx) = watch::channel((coordinator_addr, advertise_ip));
+    let rediscover = Arc::new(Notify::new());
 
     let mut rpc_child = None;
     if let Some(binary) = &args.llama_rpc_server {
-        rpc_child = Some(run_rpc_server(binary, advertise_ip, args.rpc_addr.port(), &args.llama_device).await?);
+        rpc_child = Some(run_rpc_server(binary, rpc_port, &args.llama_device).await?);
     }
 
     let heartbeat = tokio::spawn(heartbeat_loop(
+        coordinator_rx.clone(),
+        rediscover.clone(),
+        node_id,
+        capability.clone(),
+        plan_tx,
+        listen_port,
+        rpc_port,
+        args.heartbeat_secs,
+        hostname.clone(),
+    ));
+
+    let rediscover_task = tokio::spawn(rediscover_loop(
+        mdns.clone(),
+        coordinator_tx,
+        coordinator_rx,
+        rediscover,
+        fullname,
         args.coordinator,
+        args.advertise_host,
         node_id,
         capability,
-        plan_tx,
-        listen_addr,
-        args.rpc_addr,
-        args.heartbeat_secs,
         hostname,
+        listen_port,
+        rpc_port,
     ));
+
     let server = tokio::spawn(run_server(listener, state));
+
+    // Keep the mDNS daemon alive for the lifetime of the process.
+    let _mdns = mdns;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
         _ = heartbeat => {},
+        _ = rediscover_task => {},
         _ = server => {},
     }
 

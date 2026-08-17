@@ -1624,6 +1624,8 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "mdns-sd",
+ "ragtag-core",
  "ragtag-proto",
  "ratatui",
  "reqwest",
@@ -1668,6 +1670,9 @@ dependencies = [
 name = "ragtag-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "if-addrs",
+ "mdns-sd",
  "serde",
  "serde_millis",
  "uuid",
