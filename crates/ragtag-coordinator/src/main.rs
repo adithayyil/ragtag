@@ -105,6 +105,13 @@ pub struct Args {
     /// Port for the local `llama-server` HTTP API.
     #[arg(long, default_value_t = 8081)]
     llama_port: u16,
+    /// Number of layers to offload to the local GPU. Omit to let `llama-server`
+    /// use its default (`auto`); set to `0` for CPU-only, `all` for full offload.
+    #[arg(long)]
+    llama_n_gpu_layers: Option<String>,
+    /// Hostname to report in cluster stats. Defaults to the system hostname.
+    #[arg(long)]
+    hostname: Option<String>,
 }
 
 /// Shared coordinator state.
@@ -148,7 +155,10 @@ impl CoordinatorState {
             seconds_per_layer: args.seconds_per_layer,
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
             model: args.model.clone(),
-            coordinator_hostname: system_hostname(),
+            coordinator_hostname: args
+                .hostname
+                .clone()
+                .unwrap_or_else(system_hostname),
             llama_host: args.llama_host.clone(),
             llama_port: args.llama_port,
         };
@@ -586,12 +596,14 @@ struct ChatMessage {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(default)]
     stream: bool,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 async fn chat_completions(
@@ -607,11 +619,11 @@ async fn chat_completions(
         if let Some(url) = state.llama_server_url() {
             state.log_event("generation started");
 
-            let body = serde_json::json!({
-                "model": req.model,
-                "messages": req.messages,
-                "stream": false,
-            });
+            let mut body = serde_json::to_value(&req).map_err(|_| {
+                state.log_event("generation failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            body["stream"] = serde_json::Value::Bool(false);
 
             let response = state
                 .llama_client
@@ -736,6 +748,7 @@ async fn main() -> Result<()> {
             args.llama_server_binary,
             args.llama_host,
             args.llama_port,
+            args.llama_n_gpu_layers,
             plan_rx,
         );
         tokio::spawn(manager.run())

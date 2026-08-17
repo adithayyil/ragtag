@@ -84,6 +84,10 @@ struct Args {
     /// spawn and supervise a worker on `--rpc-addr` before sending heartbeats.
     #[arg(long)]
     llama_rpc_server: Option<String>,
+    /// Device string passed to `llama-rpc-server --device`. Examples: `CPU`,
+    /// `BLAS`, `CUDA0`, `Vulkan0`. Defaults to `CPU`.
+    #[arg(long, default_value = "CPU")]
+    llama_device: String,
     /// Override the automatically generated node id.
     #[arg(long)]
     node_id: Option<Uuid>,
@@ -456,14 +460,19 @@ async fn heartbeat_loop(
     }
 }
 
-async fn run_rpc_server(binary: &str, host: IpAddr, port: u16) -> Result<tokio::process::Child> {
+async fn run_rpc_server(
+    binary: &str,
+    host: IpAddr,
+    port: u16,
+    device: &str,
+) -> Result<tokio::process::Child> {
     let mut child = tokio::process::Command::new(binary)
         .arg("--host")
         .arg(host.to_string())
         .arg("--port")
         .arg(port.to_string())
         .arg("--device")
-        .arg("CPU")
+        .arg(device)
         .arg("--cache")
         .spawn()
         .context("spawn llama-rpc-server")?;
@@ -526,7 +535,7 @@ async fn main() -> Result<()> {
 
     let mut rpc_child = None;
     if let Some(binary) = &args.llama_rpc_server {
-        rpc_child = Some(run_rpc_server(binary, advertise_ip, args.rpc_addr.port()).await?);
+        rpc_child = Some(run_rpc_server(binary, advertise_ip, args.rpc_addr.port(), &args.llama_device).await?);
     }
 
     let heartbeat = tokio::spawn(heartbeat_loop(

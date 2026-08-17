@@ -15,7 +15,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio::time::{interval, Instant};
@@ -28,6 +27,7 @@ pub struct LlamaServerManager {
     binary: String,
     host: String,
     port: u16,
+    n_gpu_layers: Option<String>,
     plan_rx: watch::Receiver<PartitionPlan>,
 }
 
@@ -39,6 +39,7 @@ impl LlamaServerManager {
         binary: String,
         host: String,
         port: u16,
+        n_gpu_layers: Option<String>,
         plan_rx: watch::Receiver<PartitionPlan>,
     ) -> Self {
         Self {
@@ -47,6 +48,7 @@ impl LlamaServerManager {
             binary,
             host,
             port,
+            n_gpu_layers,
             plan_rx,
         }
     }
@@ -77,8 +79,10 @@ impl LlamaServerManager {
                             Ok(mut new_child) => {
                                 last_args = Some(args.clone());
 
-                                let wait =
-                                    tokio::spawn(Self::wait_ready(self.host.clone(), self.port));
+                                let wait = tokio::spawn(Self::wait_ready(
+                                    self.state.llama_client.clone(),
+                                    self.url(),
+                                ));
                                 tokio::select! {
                                     res = wait => match res {
                                         Ok(Ok(())) => {
@@ -177,14 +181,16 @@ impl LlamaServerManager {
             .arg(&tensor_split)
             .arg("--split-mode")
             .arg("layer")
-            .arg("--n-gpu-layers")
-            .arg("0")
             .arg("--host")
             .arg(&self.host)
             .arg("--port")
             .arg(self.port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        if let Some(n) = &self.n_gpu_layers {
+            cmd.arg("--n-gpu-layers").arg(n);
+        }
 
         let mut child = cmd.spawn().context("spawn llama-server")?;
 
@@ -211,15 +217,24 @@ impl LlamaServerManager {
         Ok(child)
     }
 
-    async fn wait_ready(host: String, port: u16) -> Result<()> {
-        let addr = format!("{}:{}", host, port);
+    async fn wait_ready(client: reqwest::Client, url: String) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut tick = interval(Duration::from_millis(250));
 
         loop {
             tick.tick().await;
-            if TcpStream::connect(&addr).await.is_ok() {
-                return Ok(());
+            match client.get(format!("{}/health", url)).send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    if resp.status().as_u16() != 503 {
+                        // Still loading; keep polling.
+                        return Err(anyhow::anyhow!(
+                            "llama-server /health returned {}",
+                            resp.status()
+                        ));
+                    }
+                }
+                Err(_) => {}
             }
             if Instant::now() >= deadline {
                 return Err(anyhow::anyhow!("llama-server readiness timeout"));
