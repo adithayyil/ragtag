@@ -18,7 +18,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt, TryStreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use ragtag_core::net::{coord_service_type, first_local_ipv4};
+use ragtag_core::net::{coord_service_type, first_local_ipv4, is_local_ipv4};
 use ragtag_core::{NodeCapability, PartitionPlan};
 use ragtag_proto::pb::{
     coordinator_server::{Coordinator, CoordinatorServer},
@@ -539,10 +539,34 @@ fn run_mdns_browse(state: Arc<CoordinatorState>, mdns: ServiceDaemon) -> Result<
                             if id == state.coordinator_id {
                                 continue;
                             }
-                            let ip = info.get_addresses().iter().next().map(|ip| ip.to_ip_addr());
-                            if let Some(ip) = ip {
-                                let port = info.get_port();
-                                let ring_addr = SocketAddr::new(ip, port);
+                            // Prefer the ring_addr TXT property set by the node; it
+                            // reflects the advertised IP and avoids ambiguity from
+                            // multi-record mDNS hostname resolution.
+                            let ring_addr = info
+                                .get_property_val_str("ring_addr")
+                                .and_then(|s| s.parse::<SocketAddr>().ok())
+                                .or_else(|| {
+                                    // Fallback: select a reachable IPv4 address,
+                                    // avoiding loopback/link-local/bridge addresses.
+                                    let mut v4s: Vec<_> = info
+                                        .get_addresses_v4()
+                                        .into_iter()
+                                        .filter(|ip| is_local_ipv4(*ip))
+                                        .collect();
+                                    if v4s.is_empty() {
+                                        v4s = info
+                                            .get_addresses_v4()
+                                            .into_iter()
+                                            .filter(|ip| {
+                                                !ip.is_loopback() && !ip.is_link_local()
+                                            })
+                                            .collect();
+                                    }
+                                    v4s.sort();
+                                    v4s.into_iter().next().map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
+                                });
+
+                            if let Some(ring_addr) = ring_addr {
                                 info!(%id, %ring_addr, "mdns service resolved");
                                 state.addrs.insert(id, ring_addr);
 

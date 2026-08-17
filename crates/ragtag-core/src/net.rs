@@ -155,11 +155,29 @@ pub fn discover_coordinator(
                 if !info.is_valid() {
                     continue;
                 }
-                let port = info.get_port();
-                let mut v4s: Vec<_> = info.get_addresses_v4().into_iter().collect();
-                v4s.sort();
-                let Some(coord_ip) = v4s.into_iter().next() else { continue };
-                let grpc = SocketAddr::new(IpAddr::V4(coord_ip), port);
+                // The coordinator advertises its chosen grpc/http endpoints in TXT
+                // records; prefer those over A-record addresses which can include
+                // bridge/loopback interfaces.
+                let grpc = info
+                    .get_property_val_str("grpc")
+                    .and_then(|s| s.parse::<SocketAddr>().ok())
+                    .or_else(|| {
+                        let mut v4s: Vec<_> = info
+                            .get_addresses_v4()
+                            .into_iter()
+                            .filter(|ip| is_local_ipv4(*ip))
+                            .collect();
+                        if v4s.is_empty() {
+                            v4s = info
+                                .get_addresses_v4()
+                                .into_iter()
+                                .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
+                                .collect();
+                        }
+                        v4s.sort();
+                        v4s.into_iter().next().map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
+                    });
+                let Some(grpc) = grpc else { continue };
                 let http = info
                     .get_property_val_str("http")
                     .and_then(|s| s.parse::<SocketAddr>().ok());

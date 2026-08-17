@@ -321,12 +321,14 @@ fn build_service_info(
     hostname: &str,
 ) -> Result<ServiceInfo> {
     let stability = format!("{:?}", capability.stability).to_lowercase();
+    let ring_addr = SocketAddr::new(advertise_ip, listen_port);
     let properties: HashMap<String, String> = [
         ("node_id", node_id.to_string()),
         ("tokens_per_sec", capability.tokens_per_sec.to_string()),
         ("free_ram_bytes", capability.free_ram_bytes.to_string()),
         ("stability", stability),
         ("rpc_addr", rpc_addr.to_string()),
+        ("ring_addr", ring_addr.to_string()),
         ("hostname", hostname.to_string()),
     ]
     .into_iter()
