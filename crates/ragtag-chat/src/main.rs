@@ -382,7 +382,11 @@ async fn send_chat(
         Ok(resp) if resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED => {
             // Coordinator does not support streaming without a ready llama-server.
             // Fall back to a one-shot request for compatibility.
-            let _ = tx.try_send(AppEvent::StreamError("streaming not available, retrying".into())).ok();
+            let _ = tx
+                .send(AppEvent::StreamError(
+                    "streaming not available, retrying".into(),
+                ))
+                .await;
             send_chat_non_stream(client, url, model, max_tokens, messages, tx).await;
             return;
         }
@@ -390,19 +394,21 @@ async fn send_chat(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             let _ = tx
-                .try_send(AppEvent::StreamError(format!("HTTP {}: {}", status, text)))
-                .ok();
+                .send(AppEvent::StreamError(format!("HTTP {}: {}", status, text)))
+                .await;
             return;
         }
         Err(e) => {
             let _ = tx
-                .try_send(AppEvent::StreamError(format!("request failed: {}", e)))
-                .ok();
+                .send(AppEvent::StreamError(format!("request failed: {}", e)))
+                .await;
             return;
         }
     };
 
-    let _ = tx.try_send(AppEvent::StreamStarted).ok();
+    if tx.send(AppEvent::StreamStarted).await.is_err() {
+        return;
+    }
 
     let stream = resp.bytes_stream().map_err(std::io::Error::other);
     let mut reader = BufReader::new(StreamReader::new(stream));
@@ -426,9 +432,13 @@ async fn send_chat(
                                 .and_then(|c| c.delta.content.as_deref())
                                 .filter(|s| !s.is_empty())
                             {
-                                let _ = tx
-                                    .try_send(AppEvent::StreamToken(content.to_string()))
-                                    .ok();
+                                if tx
+                                    .send(AppEvent::StreamToken(content.to_string()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                             if chunk
                                 .choices
@@ -441,22 +451,22 @@ async fn send_chat(
                         }
                         Err(e) => {
                             let _ = tx
-                                .try_send(AppEvent::StreamError(format!("stream parse: {}", e)))
-                                .ok();
+                                .send(AppEvent::StreamError(format!("stream parse: {}", e)))
+                                .await;
                         }
                     }
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .try_send(AppEvent::StreamError(format!("stream read: {}", e)))
-                    .ok();
+                    .send(AppEvent::StreamError(format!("stream read: {}", e)))
+                    .await;
                 break;
             }
         }
     }
 
-    let _ = tx.try_send(AppEvent::StreamDone).ok();
+    let _ = tx.send(AppEvent::StreamDone).await;
 }
 
 async fn send_chat_non_stream(
@@ -484,34 +494,34 @@ async fn send_chat_non_stream(
             Ok(body) => {
                 if let Some(choice) = body.choices.first() {
                     let _ = tx
-                        .try_send(AppEvent::ChatResponse(Message {
+                        .send(AppEvent::ChatResponse(Message {
                             role: "assistant".into(),
                             content: choice.message.content.clone(),
                         }))
-                        .ok();
+                        .await;
                 } else {
                     let _ = tx
-                        .try_send(AppEvent::Error("no choices in response".into()))
-                        .ok();
+                        .send(AppEvent::Error("no choices in response".into()))
+                        .await;
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .try_send(AppEvent::Error(format!("parse error: {}", e)))
-                    .ok();
+                    .send(AppEvent::Error(format!("parse error: {}", e)))
+                    .await;
             }
         },
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             let _ = tx
-                .try_send(AppEvent::Error(format!("HTTP {}: {}", status, text)))
-                .ok();
+                .send(AppEvent::Error(format!("HTTP {}: {}", status, text)))
+                .await;
         }
         Err(e) => {
             let _ = tx
-                .try_send(AppEvent::Error(format!("request failed: {}", e)))
-                .ok();
+                .send(AppEvent::Error(format!("request failed: {}", e)))
+                .await;
         }
     }
 }
@@ -572,6 +582,9 @@ async fn run_app(mut app: App) -> Result<()> {
                     KeyCode::Enter => {
                         let input = app.input.trim().to_string();
                         if input.is_empty() {
+                            continue;
+                        }
+                        if app.generating {
                             continue;
                         }
                         if input == "/quit" {
