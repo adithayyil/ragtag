@@ -385,7 +385,7 @@ impl Coordinator for CoordinatorService {
             self.0.log_event(format!("node {} reachable", hostname));
         }
 
-        if is_new || stability_changed {
+        if is_new || was_unreachable || stability_changed {
             self.0.recompute_plan_or_empty();
         }
 

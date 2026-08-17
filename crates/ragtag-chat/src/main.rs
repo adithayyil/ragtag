@@ -38,7 +38,7 @@ struct Args {
     #[arg(long)]
     system: Option<String>,
 
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 128)]
     max_tokens: u32,
 }
 
