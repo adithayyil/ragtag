@@ -81,11 +81,8 @@ impl LlamaServerManager {
                             Ok(mut new_child) => {
                                 last_args = Some(args);
 
-                                match Self::wait_ready(
-                                    self.state.llama_client.clone(),
-                                    self.url(),
-                                )
-                                .await
+                                match Self::wait_ready(self.state.llama_client.clone(), self.url())
+                                    .await
                                 {
                                     Ok(()) => {
                                         self.set_ready(true);

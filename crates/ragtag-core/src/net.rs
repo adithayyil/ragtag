@@ -142,7 +142,9 @@ pub fn discover_coordinator(
     mdns: &mdns_sd::ServiceDaemon,
     timeout: Duration,
 ) -> Result<Option<DiscoveredCoordinator>> {
-    let receiver = mdns.browse(&coord_service_type()).context("browse coordinator")?;
+    let receiver = mdns
+        .browse(&coord_service_type())
+        .context("browse coordinator")?;
     let deadline = std::time::Instant::now() + timeout;
     let mut candidates: Vec<DiscoveredCoordinator> = Vec::new();
 
@@ -175,7 +177,9 @@ pub fn discover_coordinator(
                                 .collect();
                         }
                         v4s.sort();
-                        v4s.into_iter().next().map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
+                        v4s.into_iter()
+                            .next()
+                            .map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
                     });
                 let Some(grpc) = grpc else { continue };
                 let http = info

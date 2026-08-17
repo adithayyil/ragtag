@@ -540,7 +540,9 @@ async fn rediscover_loop(
             _ = interval.tick() => false,
         };
 
-        let discovered = discover_coordinator(&mdns, Duration::from_secs(2)).ok().flatten();
+        let discovered = discover_coordinator(&mdns, Duration::from_secs(2))
+            .ok()
+            .flatten();
 
         let (mut best_coord, mut best_ip) = {
             let (cur_coord, cur_ip) = *coordinator_rx.borrow();
@@ -623,11 +625,7 @@ async fn rediscover_loop(
     }
 }
 
-async fn run_rpc_server(
-    binary: &str,
-    port: u16,
-    device: &str,
-) -> Result<tokio::process::Child> {
+async fn run_rpc_server(binary: &str, port: u16, device: &str) -> Result<tokio::process::Child> {
     // Bind on 0.0.0.0 so we can accept both direct LAN connections and
     // reverse-forwarded tunnel connections (which land on 127.0.0.1).
     let mut child = tokio::process::Command::new(binary)
@@ -673,7 +671,10 @@ async fn main() -> Result<()> {
 
     let discovered = discover_coordinator(&mdns, Duration::from_secs(3))?;
 
-    let coordinator_addr = discovered.as_ref().map(|d| d.grpc).unwrap_or(args.coordinator);
+    let coordinator_addr = discovered
+        .as_ref()
+        .map(|d| d.grpc)
+        .unwrap_or(args.coordinator);
     let coord_ip = discovered.as_ref().and_then(|d| match d.grpc.ip() {
         IpAddr::V4(v4) if ragtag_core::net::is_local_ipv4(v4) => Some(v4),
         _ => None,

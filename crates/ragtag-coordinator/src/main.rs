@@ -168,10 +168,7 @@ impl CoordinatorState {
             seconds_per_layer: args.seconds_per_layer,
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
             model: args.model.clone(),
-            coordinator_hostname: args
-                .hostname
-                .clone()
-                .unwrap_or_else(system_hostname),
+            coordinator_hostname: args.hostname.clone().unwrap_or_else(system_hostname),
             llama_host: args.llama_host.clone(),
             llama_port: args.llama_port,
         };
@@ -557,13 +554,13 @@ fn run_mdns_browse(state: Arc<CoordinatorState>, mdns: ServiceDaemon) -> Result<
                                         v4s = info
                                             .get_addresses_v4()
                                             .into_iter()
-                                            .filter(|ip| {
-                                                !ip.is_loopback() && !ip.is_link_local()
-                                            })
+                                            .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
                                             .collect();
                                     }
                                     v4s.sort();
-                                    v4s.into_iter().next().map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
+                                    v4s.into_iter()
+                                        .next()
+                                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), info.get_port()))
                                 });
 
                             if let Some(ring_addr) = ring_addr {
@@ -644,7 +641,8 @@ fn register_coordinator(
     )
     .context("create coordinator mdns service info")?;
 
-    mdns.register(info).context("register coordinator mdns service")?;
+    mdns.register(info)
+        .context("register coordinator mdns service")?;
     Ok(())
 }
 
@@ -722,11 +720,7 @@ async fn chat_completions(
                                     if data == "[DONE]" {
                                         break;
                                     }
-                                    if tx
-                                        .send(Ok(Event::default().data(data)))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if tx.send(Ok(Event::default().data(data))).await.is_err() {
                                         break;
                                     }
                                 }
@@ -840,17 +834,16 @@ async fn main() -> Result<()> {
     };
 
     let hostname = args.hostname.clone().unwrap_or_else(system_hostname);
-    let advertise_ip: IpAddr = if args.advertise_host.eq_ignore_ascii_case("auto")
-        || args.advertise_host == "0.0.0.0"
-    {
-        first_local_ipv4()
-            .map(IpAddr::V4)
-            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
-    } else {
-        args.advertise_host
-            .parse()
-            .context("parse advertise-host as IP")?
-    };
+    let advertise_ip: IpAddr =
+        if args.advertise_host.eq_ignore_ascii_case("auto") || args.advertise_host == "0.0.0.0" {
+            first_local_ipv4()
+                .map(IpAddr::V4)
+                .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        } else {
+            args.advertise_host
+                .parse()
+                .context("parse advertise-host as IP")?
+        };
 
     let grpc_listener = TcpListener::bind(args.grpc)
         .await
